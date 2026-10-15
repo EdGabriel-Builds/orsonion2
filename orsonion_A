@@ -1,0 +1,148 @@
+
+# Check if running as Administrator
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "ERROR: This script must be run as Administrator!" -ForegroundColor Red
+    Write-Host "Please right-click PowerShell and select 'Run as Administrator'" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host "Starting Security Configuration" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host ""
+
+
+Write-Host "[1/3] Configuring Password Policy..." -ForegroundColor Green
+
+try {
+    # Enforce password history: Remember the last 24 passwords
+    # This prevents users from reusing recent passwords
+    net accounts /uniquepw:24
+    
+    # Maximum password age: 60 days
+    # Forces users to change passwords every 60 days
+    net accounts /maxpwage:60
+    
+    # Minimum password age: 10 days
+    # Prevents users from changing password multiple times to bypass history
+    net accounts /minpwage:10
+    
+    # Minimum password length: 14 characters
+    # Ensures passwords are sufficiently long
+    net accounts /minpwlen:14
+    
+    Write-Host "  ✓ Password history set to 24" -ForegroundColor White
+    Write-Host "  ✓ Maximum password age set to 60 days" -ForegroundColor White
+    Write-Host "  ✓ Minimum password age set to 10 days" -ForegroundColor White
+    Write-Host "  ✓ Minimum password length set to 14 characters" -ForegroundColor White
+    
+    # Export current security policy to file
+    secedit /export /cfg c:\secpol.cfg | Out-Null
+    
+    # Password complexity requirements: Enabled
+    # Requires passwords to contain uppercase, lowercase, numbers, and special characters
+    (Get-Content c:\secpol.cfg) -replace "PasswordComplexity = 0", "PasswordComplexity = 1" | Set-Content c:\secpol.cfg
+    
+    # Store passwords using reversible encryption: Disabled
+    # This setting ensures passwords are not stored in a reversible format
+    (Get-Content c:\secpol.cfg) -replace "ClearTextPassword = 1", "ClearTextPassword = 0" | Set-Content c:\secpol.cfg
+    
+    # Apply the security policy changes
+    secedit /configure /db c:\windows\security\local.sdb /cfg c:\secpol.cfg /areas SECURITYPOLICY | Out-Null
+    Remove-Item -force c:\secpol.cfg -confirm:$false
+    
+    Write-Host "  ✓ Password complexity requirements enabled" -ForegroundColor White
+    Write-Host "  ✓ Reversible encryption disabled" -ForegroundColor White
+    
+    Write-Host ""
+} catch {
+    Write-Host "  ✗ ERROR configuring password policy: $_" -ForegroundColor Red
+    Write-Host ""
+}
+
+Write-Host "[2/3] Configuring Account Lockout Policy..." -ForegroundColor Green
+
+try {
+    # Export current security policy to a temporary configuration file
+    secedit /export /cfg c:\secpol_lockout.cfg | Out-Null
+    
+    # Account lockout threshold: 5 invalid login attempts
+    # Locks account after 5 failed login attempts
+    (Get-Content c:\secpol_lockout.cfg) -replace "LockoutBadCount = \d+", "LockoutBadCount = 5" | Set-Content c:\secpol_lockout.cfg
+    
+    # Account lockout duration: 30 minutes
+    # Account remains locked for 30 minutes before auto-unlock
+    # Value is in minutes
+    (Get-Content c:\secpol_lockout.cfg) -replace "LockoutDuration = -?\d+", "LockoutDuration = 30" | Set-Content c:\secpol_lockout.cfg
+    
+    # Reset account lockout counter after: 30 minutes
+    # Failed attempt counter resets after 30 minutes of no failed attempts
+    # Value is in minutes
+    (Get-Content c:\secpol_lockout.cfg) -replace "ResetLockoutCount = \d+", "ResetLockoutCount = 30" | Set-Content c:\secpol_lockout.cfg
+    
+    # Apply the lockout policy changes using secedit
+    secedit /configure /db c:\windows\security\local.sdb /cfg c:\secpol_lockout.cfg /areas SECURITYPOLICY | Out-Null
+    
+    # Clean up temporary file
+    Remove-Item -force c:\secpol_lockout.cfg -confirm:$false
+    
+    Write-Host "  ✓ Account lockout threshold set to 5 attempts" -ForegroundColor White
+    Write-Host "  ✓ Account lockout duration set to 30 minutes" -ForegroundColor White
+    Write-Host "  ✓ Lockout counter reset set to 30 minutes" -ForegroundColor White
+    Write-Host ""
+} catch {
+    Write-Host "  ✗ ERROR configuring lockout policy: $_" -ForegroundColor Red
+    Write-Host ""
+}
+
+
+Write-Host "[3/3] Disabling SMB v1..." -ForegroundColor Green
+
+try {
+    # Check if SMB v1 is currently enabled
+    $smbv1Status = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol
+    
+    if ($smbv1Status.State -eq "Enabled") {
+        Write-Host "  - SMB v1 is currently enabled, disabling now..." -ForegroundColor Yellow
+        
+        # Disable SMB v1 Protocol
+        # SMB v1 is outdated and has known security vulnerabilities (e.g., WannaCry ransomware)
+        Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart
+        
+        Write-Host "  ✓ SMB v1 has been disabled" -ForegroundColor White
+        Write-Host "  ⚠ IMPORTANT: A system restart is required for changes to take effect" -ForegroundColor Yellow
+    } else {
+        Write-Host "  ✓ SMB v1 is already disabled" -ForegroundColor White
+    }
+    Write-Host ""
+} catch {
+    Write-Host "  ✗ ERROR disabling SMB v1: $_" -ForegroundColor Red
+    Write-Host ""
+}
+
+
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host "Security Configuration Complete!" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Summary of changes:" -ForegroundColor White
+Write-Host "  • Password Policy: 24 history, 10 day min age, 14 char length" -ForegroundColor White
+Write-Host "  • Lockout Policy: 5 attempt threshold, 30 min duration" -ForegroundColor White
+Write-Host "  • SMB v1: Disabled" -ForegroundColor White
+Write-Host ""
+Write-Host "⚠ NEXT STEPS:" -ForegroundColor Yellow
+Write-Host "  1. Review the changes above to ensure they meet your requirements" -ForegroundColor White
+Write-Host "  2. Restart the server to fully apply SMB v1 changes" -ForegroundColor White
+Write-Host "  3. Test user login and password policies" -ForegroundColor White
+Write-Host ""
+
+# Prompt for restart
+$restart = Read-Host "Would you like to restart the server now? (Y/N)"
+if ($restart -eq 'Y' -or $restart -eq 'y') {
+    Write-Host "Restarting server in 60 seconds..." -ForegroundColor Yellow
+    Write-Host "Press Ctrl+C to cancel" -ForegroundColor Yellow
+    shutdown /r /t 60 /c "Restarting to apply SMB v1 configuration changes"
+} else {
+    Write-Host "Restart postponed. Remember to restart manually later!" -ForegroundColor Yellow
+}
