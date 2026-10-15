@@ -1,4 +1,10 @@
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+#Requires -RunAsAdministrator
+# Windows hardening script (fixed). ASCII-only so it parses in Windows PowerShell 5.1.
+
+$ErrorActionPreference = 'Stop'
+$failed = [System.Collections.Generic.List[string]]::new()
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "ERROR: This script must be run as Administrator!" -ForegroundColor Red
     exit 1
@@ -9,139 +15,250 @@ Write-Host "Starting Configuration" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Set (or add) Key<Sep>Value inside [Section] of an INF-style secedit config.
+function Set-InfValue {
+    param(
+        [System.Collections.Generic.List[string]]$Lines,
+        [string]$Section,
+        [string]$Key,
+        [string]$Value,
+        [string]$Sep = ' = '
+    )
+    $start = -1
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i].Trim() -ieq "[$Section]") { $start = $i; break }
+    }
+    if ($start -lt 0) { $Lines.Add("[$Section]"); $start = $Lines.Count - 1 }
+
+    $end = $Lines.Count
+    for ($i = $start + 1; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i].Trim().StartsWith('[')) { $end = $i; break }
+    }
+
+    $newLine = "$Key$Sep$Value"
+    for ($i = $start + 1; $i -lt $end; $i++) {
+        $k = ($Lines[$i] -split '=', 2)[0].Trim()
+        if ($k -ieq $Key) { $Lines[$i] = $newLine; return }
+    }
+    $Lines.Insert($end, $newLine)   # key wasn't in the export: add it
+}
+
+# Export -> edit -> re-import one secedit area, with real error checking.
+function Invoke-SeceditArea {
+    param([string]$Area, [scriptblock]$Edit)
+
+    $cfg = Join-Path $env:TEMP "secpol_$Area.cfg"
+    $db  = Join-Path $env:windir 'security\local.sdb'
+    try {
+        & secedit.exe /export /cfg $cfg /areas $Area | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "secedit /export failed (exit $LASTEXITCODE)" }
+
+        $lines = [System.Collections.Generic.List[string]]::new([string[]](Get-Content -Path $cfg))
+        & $Edit $lines
+
+        # secedit requires UTF-16; Set-Content's default in PS 5.1 is ANSI.
+        Set-Content -Path $cfg -Value $lines -Encoding Unicode
+
+        & secedit.exe /configure /db $db /cfg $cfg /areas $Area /quiet | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "secedit /configure failed (exit $LASTEXITCODE); see %windir%\security\logs\scesrv.log" }
+    }
+    finally {
+        Remove-Item -Path $cfg -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# [1/3] Firewall rules
+# ---------------------------------------------------------------------------
 Write-Host "[1/3] Configuring Firewall Rules..." -ForegroundColor Green
 
-try {
-    New-NetFirewallRule -DisplayName "Block MS Edge" -Direction Inbound -Program "%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe" -Action Block -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "Block Search" -Direction Inbound -Program "%SystemRoot%\SystemApps\Microsoft.Windows.Search_cw5n1h2txyewy\SearchApp.exe" -Action Block -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "Block MSN Money" -Direction Inbound -Program "%SystemRoot%\SystemApps\Microsoft.BingFinance_8wekyb3d8bbwe\Finance.exe" -Action Block -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "Block MSN Sports" -Direction Inbound -Program "%SystemRoot%\SystemApps\Microsoft.BingSports_8wekyb3d8bbwe\Sports.exe" -Action Block -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "Block MSN News" -Direction Inbound -Program "%SystemRoot%\SystemApps\Microsoft.BingNews_8wekyb3d8bbwe\News.exe" -Action Block -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "Block MSN Weather" -Direction Inbound -Program "%SystemRoot%\SystemApps\Microsoft.BingWeather_8wekyb3d8bbwe\Weather.exe" -Action Block -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "Block Microsoft Photos" -Direction Inbound -Program "%SystemRoot%\SystemApps\Microsoft.Windows.Photos_8wekyb3d8bbwe\Photos.exe" -Action Block -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "Block Xbox" -Direction Inbound -Program "%SystemRoot%\SystemApps\Microsoft.Xbox*" -Action Block -ErrorAction SilentlyContinue
-    
-    Write-Host "  ✓ Firewall rules configured" -ForegroundColor White
-    Write-Host ""
-} catch {
-    Write-Host "  ✗ ERROR configuring firewall rules: $_" -ForegroundColor Red
-    Write-Host ""
+function Add-BlockRule {
+    param([string]$Name, [string]$Program)
+    $exe = Split-Path $Program -Leaf
+    foreach ($dir in 'Outbound', 'Inbound') {
+        $display = "$Name - $exe ($dir)"
+        Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue | Remove-NetFirewallRule   # idempotent
+        New-NetFirewallRule -DisplayName $display -Direction $dir -Program $Program -Action Block | Out-Null
+    }
 }
 
+try {
+    # Classic Win32 program: Edge
+    $edgePaths = @(
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+    ) | Where-Object { Test-Path $_ }
+    if (-not $edgePaths) { Write-Host "  - Edge not found, skipped" -ForegroundColor Yellow }
+    foreach ($p in $edgePaths) { Add-BlockRule -Name 'Block MS Edge' -Program $p }
+
+    # Store/system apps: resolve real install folders (they are versioned, so hard-coded paths miss)
+    $appx = [ordered]@{
+        'Block Search'           = 'Microsoft.Windows.Search'
+        'Block MSN Money'        = 'Microsoft.BingFinance'
+        'Block MSN Sports'       = 'Microsoft.BingSports'
+        'Block MSN News'         = 'Microsoft.BingNews'
+        'Block MSN Weather'      = 'Microsoft.BingWeather'
+        'Block Microsoft Photos' = 'Microsoft.Windows.Photos'
+        'Block Xbox'             = 'Microsoft.Xbox*'
+    }
+    foreach ($label in $appx.Keys) {
+        $pkgs = Get-AppxPackage -AllUsers -Name $appx[$label] -ErrorAction SilentlyContinue
+        if (-not $pkgs) { Write-Host "  - $label : package not installed, skipped" -ForegroundColor Yellow; continue }
+        $count = 0
+        foreach ($pkg in $pkgs) {
+            if (-not $pkg.InstallLocation) { continue }
+            $exes = Get-ChildItem -Path $pkg.InstallLocation -Filter *.exe -File -Recurse -Depth 2 -ErrorAction SilentlyContinue
+            foreach ($exe in $exes) { Add-BlockRule -Name $label -Program $exe.FullName; $count++ }
+        }
+        if ($count -eq 0) { Write-Host "  - $label : no executables found (folder may be access-restricted)" -ForegroundColor Yellow }
+    }
+
+    Write-Host "  [OK] Firewall rules configured" -ForegroundColor White
+}
+catch {
+    Write-Host "  [X] ERROR configuring firewall rules: $_" -ForegroundColor Red
+    $failed.Add('Firewall')
+}
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# [2/3] User rights assignment
+# ---------------------------------------------------------------------------
 Write-Host "[2/3] Configuring User Rights Assignment..." -ForegroundColor Green
 
-try {
-    secedit /export /cfg c:\secpol_rights.cfg | Out-Null
-    
-    $content = Get-Content c:\secpol_rights.cfg
-    
-    $content = $content -replace "SeNetworkLogonRight = .*", "SeNetworkLogonRight = *S-1-5-32-544"
-    $content = $content -replace "SeInteractiveLogonRight = .*", "SeInteractiveLogonRight = *S-1-5-32-544,*S-1-5-32-545"
-    $content = $content -replace "SeBackupPrivilege = .*", "SeBackupPrivilege = *S-1-5-32-544"
-    $content = $content -replace "SeDenyNetworkLogonRight = .*", "SeDenyNetworkLogonRight = *S-1-5-32-546,*S-1-5-113"
-    $content = $content -replace "SeDenyBatchLogonRight = .*", "SeDenyBatchLogonRight = *S-1-5-32-546"
-    $content = $content -replace "SeDenyServiceLogonRight = .*", "SeDenyServiceLogonRight = *S-1-5-32-546"
-    $content = $content -replace "SeDenyInteractiveLogonRight = .*", "SeDenyInteractiveLogonRight = *S-1-5-32-546"
-    $content = $content -replace "SeDenyRemoteInteractiveLogonRight = .*", "SeDenyRemoteInteractiveLogonRight = *S-1-5-32-546,*S-1-5-113"
-    $content = $content -replace "SeBatchLogonRight = .*", "SeBatchLogonRight = *S-1-5-32-544"
-    $content = $content -replace "SeServiceLogonRight = .*", "SeServiceLogonRight = "
-    $content = $content -replace "SeShutdownPrivilege = .*", "SeShutdownPrivilege = *S-1-5-32-544,*S-1-5-32-545"
-    
-    $content | Set-Content c:\secpol_rights.cfg
-    
-    secedit /configure /db c:\windows\security\local.sdb /cfg c:\secpol_rights.cfg /areas USER_RIGHTS | Out-Null
-    
-    Remove-Item -force c:\secpol_rights.cfg -confirm:$false
-    
-    Write-Host "  ✓ User Rights Assignment configured" -ForegroundColor White
-    Write-Host ""
-} catch {
-    Write-Host "  ✗ ERROR configuring User Rights Assignment: $_" -ForegroundColor Red
-    Write-Host ""
+$userRights = [ordered]@{
+    SeNetworkLogonRight                = '*S-1-5-32-544'
+    SeInteractiveLogonRight            = '*S-1-5-32-544,*S-1-5-32-545'
+    SeBackupPrivilege                  = '*S-1-5-32-544'
+    SeDenyNetworkLogonRight            = '*S-1-5-32-546,*S-1-5-113'
+    SeDenyBatchLogonRight              = '*S-1-5-32-546'
+    SeDenyServiceLogonRight            = '*S-1-5-32-546'
+    SeDenyInteractiveLogonRight        = '*S-1-5-32-546'
+    SeDenyRemoteInteractiveLogonRight  = '*S-1-5-32-546,*S-1-5-113'
+    SeBatchLogonRight                  = '*S-1-5-32-544'
+    # SeServiceLogonRight intentionally NOT touched: blanking it breaks services that run under named accounts.
+    SeShutdownPrivilege                = '*S-1-5-32-544,*S-1-5-32-545'
 }
 
+try {
+    Invoke-SeceditArea -Area 'USER_RIGHTS' -Edit {
+        param($lines)
+        foreach ($k in $userRights.Keys) {
+            Set-InfValue -Lines $lines -Section 'Privilege Rights' -Key $k -Value $userRights[$k]
+        }
+    }
+    Write-Host "  [OK] User Rights Assignment configured" -ForegroundColor White
+}
+catch {
+    Write-Host "  [X] ERROR configuring User Rights Assignment: $_" -ForegroundColor Red
+    $failed.Add('UserRights')
+}
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# [3/3] Local security policy options
+# ---------------------------------------------------------------------------
 Write-Host "[3/3] Configuring Local Security Policy Options..." -ForegroundColor Green
 
-try {
-    secedit /export /cfg c:\secpol_options.cfg | Out-Null
-    
-    $content = Get-Content c:\secpol_options.cfg
-    
-    $content = $content -replace "EnableAdminAccount = \d", "EnableAdminAccount = 0"
-    $content = $content -replace "EnableGuestAccount = \d", "EnableGuestAccount = 0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\LimitBlankPasswordUse=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\LimitBlankPasswordUse=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\SCENoApplyLegacyAuditPolicy=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\SCENoApplyLegacyAuditPolicy=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\AllocateDASD=.*", "MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\AllocateDASD=1,\"0\""
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Print\\Providers\\LanMan Print Services\\Servers\\AddPrinterDrivers=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Print\\Providers\\LanMan Print Services\\Servers\\AddPrinterDrivers=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\RequireSignOrSeal=.*", "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\RequireSignOrSeal=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\SealSecureChannel=.*", "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\SealSecureChannel=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\SignSecureChannel=.*", "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\SignSecureChannel=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\DisablePasswordChange=.*", "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\DisablePasswordChange=4,0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\MaximumPasswordAge=.*", "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\MaximumPasswordAge=4,30"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\RequireStrongKey=.*", "MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\RequireStrongKey=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\DontDisplayLastUserName=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\DontDisplayLastUserName=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\DisableCAD=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\DisableCAD=4,0"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\InactivityTimeoutSecs=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\InactivityTimeoutSecs=4,900"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\PasswordExpiryWarning=.*", "MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\PasswordExpiryWarning=4,14"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\ScRemoveOption=.*", "MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\ScRemoveOption=1,\"1\""
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\RequireSecuritySignature=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\RequireSecuritySignature=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\EnableSecuritySignature=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\EnableSecuritySignature=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\EnablePlainTextPassword=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\EnablePlainTextPassword=4,0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\AutoDisconnect=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\AutoDisconnect=4,15"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\RequireSecuritySignature=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\RequireSecuritySignature=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\EnableSecuritySignature=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\EnableSecuritySignature=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\EnableForcedLogOff=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\EnableForcedLogOff=4,1"
-    $content = $content -replace "LSAAnonymousNameLookup = \d", "LSAAnonymousNameLookup = 0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\RestrictAnonymousSAM=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\RestrictAnonymousSAM=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\RestrictAnonymous=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\RestrictAnonymous=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\DisableDomainCreds=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\DisableDomainCreds=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\EveryoneIncludesAnonymous=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\EveryoneIncludesAnonymous=4,0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\RestrictNullSessAccess=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LanManServer\\Parameters\\RestrictNullSessAccess=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\ForceGuest=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\ForceGuest=4,0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\MSV1_0\\allownullsessionfallback=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\MSV1_0\\allownullsessionfallback=4,0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\NoLMHash=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\NoLMHash=4,1"
-    $content = $content -replace "ForceLogoffWhenHourExpire = \d", "ForceLogoffWhenHourExpire = 1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\LmCompatibilityLevel=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\LmCompatibilityLevel=4,5"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Services\\LDAP\\LDAPClientIntegrity=.*", "MACHINE\\System\\CurrentControlSet\\Services\\LDAP\\LDAPClientIntegrity=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\MSV1_0\\NTLMMinClientSec=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\MSV1_0\\NTLMMinClientSec=4,537395200"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\MSV1_0\\NTLMMinServerSec=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\MSV1_0\\NTLMMinServerSec=4,537395200"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\ShutdownWithoutLogon=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\ShutdownWithoutLogon=4,0"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Session Manager\\Kernel\\ObCaseInsensitive=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Session Manager\\Kernel\\ObCaseInsensitive=4,1"
-    $content = $content -replace "MACHINE\\System\\CurrentControlSet\\Control\\Session Manager\\ProtectionMode=.*", "MACHINE\\System\\CurrentControlSet\\Control\\Session Manager\\ProtectionMode=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\FilterAdministratorToken=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\FilterAdministratorToken=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableUIADesktopToggle=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableUIADesktopToggle=4,0"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\ConsentPromptBehaviorAdmin=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\ConsentPromptBehaviorAdmin=4,2"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\ConsentPromptBehaviorUser=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\ConsentPromptBehaviorUser=4,0"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableInstallerDetection=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableInstallerDetection=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableSecureUIAPaths=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableSecureUIAPaths=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableLUA=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableLUA=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\PromptOnSecureDesktop=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\PromptOnSecureDesktop=4,1"
-    $content = $content -replace "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableVirtualization=.*", "MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableVirtualization=4,1"
-    
-    $content | Set-Content c:\secpol_options.cfg
-    
-    secedit /configure /db c:\windows\security\local.sdb /cfg c:\secpol_options.cfg /areas SECURITYPOLICY | Out-Null
-    
-    Remove-Item -force c:\secpol_options.cfg -confirm:$false
-    
-    Write-Host "  ✓ Local Security Policy Options configured" -ForegroundColor White
-    Write-Host ""
-} catch {
-    Write-Host "  ✗ ERROR configuring Local Security Policy: $_" -ForegroundColor Red
-    Write-Host ""
+$systemAccess = [ordered]@{
+    EnableAdminAccount        = '0'
+    EnableGuestAccount        = '0'
+    LSAAnonymousNameLookup    = '0'
+    ForceLogoffWhenHourExpire = '1'
 }
 
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "Configuration Complete!" -ForegroundColor Cyan
-Write-Host "============================================" -ForegroundColor Cyan
+$lsa  = 'MACHINE\System\CurrentControlSet\Control\Lsa'
+$net  = 'MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters'
+$wks  = 'MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters'
+$srv  = 'MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters'
+$pol  = 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System'
+$wl   = 'MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
+$sm   = 'MACHINE\System\CurrentControlSet\Control\Session Manager'
+
+$registryValues = [ordered]@{
+    "$lsa\LimitBlankPasswordUse"                 = '4,1'
+    "$lsa\SCENoApplyLegacyAuditPolicy"           = '4,1'
+    "$wl\AllocateDASD"                           = '1,"0"'
+    'MACHINE\System\CurrentControlSet\Control\Print\Providers\LanMan Print Services\Servers\AddPrinterDrivers' = '4,1'
+    "$net\RequireSignOrSeal"                     = '4,1'
+    "$net\SealSecureChannel"                     = '4,1'
+    "$net\SignSecureChannel"                     = '4,1'
+    "$net\DisablePasswordChange"                 = '4,0'
+    "$net\MaximumPasswordAge"                    = '4,30'
+    "$net\RequireStrongKey"                      = '4,1'
+    "$pol\DontDisplayLastUserName"               = '4,1'
+    "$pol\DisableCAD"                            = '4,0'
+    "$pol\InactivityTimeoutSecs"                 = '4,900'
+    "$wl\PasswordExpiryWarning"                  = '4,14'
+    "$wl\ScRemoveOption"                         = '1,"1"'
+    "$wks\RequireSecuritySignature"              = '4,1'
+    "$wks\EnableSecuritySignature"               = '4,1'
+    "$wks\EnablePlainTextPassword"               = '4,0'
+    "$srv\AutoDisconnect"                        = '4,15'
+    "$srv\RequireSecuritySignature"              = '4,1'
+    "$srv\EnableSecuritySignature"               = '4,1'
+    "$srv\EnableForcedLogOff"                    = '4,1'
+    "$lsa\RestrictAnonymousSAM"                  = '4,1'
+    "$lsa\RestrictAnonymous"                     = '4,1'
+    "$lsa\DisableDomainCreds"                    = '4,1'
+    "$lsa\EveryoneIncludesAnonymous"             = '4,0'
+    "$srv\RestrictNullSessAccess"                = '4,1'
+    "$lsa\ForceGuest"                            = '4,0'
+    "$lsa\MSV1_0\allownullsessionfallback"       = '4,0'
+    "$lsa\NoLMHash"                              = '4,1'
+    "$lsa\LmCompatibilityLevel"                  = '4,5'
+    'MACHINE\System\CurrentControlSet\Services\LDAP\LDAPClientIntegrity' = '4,1'
+    "$lsa\MSV1_0\NTLMMinClientSec"               = '4,537395200'
+    "$lsa\MSV1_0\NTLMMinServerSec"               = '4,537395200'
+    "$pol\ShutdownWithoutLogon"                  = '4,0'
+    "$sm\Kernel\ObCaseInsensitive"               = '4,1'
+    "$sm\ProtectionMode"                         = '4,1'
+    "$pol\FilterAdministratorToken"              = '4,1'
+    "$pol\EnableUIADesktopToggle"                = '4,0'
+    "$pol\ConsentPromptBehaviorAdmin"            = '4,2'
+    "$pol\ConsentPromptBehaviorUser"             = '4,0'
+    "$pol\EnableInstallerDetection"              = '4,1'
+    "$pol\EnableSecureUIAPaths"                  = '4,1'
+    "$pol\EnableLUA"                             = '4,1'
+    "$pol\PromptOnSecureDesktop"                 = '4,1'
+    "$pol\EnableVirtualization"                  = '4,1'
+}
+
+try {
+    Invoke-SeceditArea -Area 'SECURITYPOLICY' -Edit {
+        param($lines)
+        foreach ($k in $systemAccess.Keys) {
+            Set-InfValue -Lines $lines -Section 'System Access' -Key $k -Value $systemAccess[$k]
+        }
+        foreach ($k in $registryValues.Keys) {
+            Set-InfValue -Lines $lines -Section 'Registry Values' -Key $k -Value $registryValues[$k] -Sep '='
+        }
+    }
+    Write-Host "  [OK] Local Security Policy Options configured" -ForegroundColor White
+}
+catch {
+    Write-Host "  [X] ERROR configuring Local Security Policy: $_" -ForegroundColor Red
+    $failed.Add('SecurityPolicy')
+}
 Write-Host ""
-Write-Host "Summary:" -ForegroundColor White
-Write-Host "  • Firewall Rules: Configured" -ForegroundColor White
-Write-Host "  • User Rights Assignment: Configured" -ForegroundColor White
-Write-Host "  • Local Security Policy: Configured" -ForegroundColor White
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+Write-Host "============================================" -ForegroundColor Cyan
+if ($failed.Count -eq 0) {
+    Write-Host "Configuration Complete!" -ForegroundColor Cyan
+} else {
+    Write-Host "Configuration finished with errors: $($failed -join ', ')" -ForegroundColor Yellow
+}
+Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
 $refresh = Read-Host "Run 'gpupdate /force'? (Y/N)"
-if ($refresh -eq 'Y' -or $refresh -eq 'y') {
+if ($refresh -match '^[Yy]') {
     gpupdate /force
 }
